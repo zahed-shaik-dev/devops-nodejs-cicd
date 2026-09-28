@@ -2,10 +2,16 @@ name: CI-CD
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+
   pull_request:
-    types: [opened, synchronize, reopened]
-    branches: [main]
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
 
 permissions:
   contents: read
@@ -15,104 +21,132 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  NODE_VERSION: '22'
-  REGISTRY: docker.io
-  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/devops-cicd-node-api
-  APP_PORT: '3000'
+  NODE_VERSION: "22"
+  DOCKER_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/devops-cicd-node-api
+  APP_PORT: "3000"
   CONTAINER_NAME: devops-cicd-node-api
 
 jobs:
+
+  # ==========================================
+  # 1. TEST
+  # ==========================================
   test:
     name: Lint, Security & Unit Tests
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
+      - name: Checkout source code
+        uses: actions/checkout@v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
+          cache: npm
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
-      - name: Lint
+      - name: Run ESLint
         run: npm run lint
 
-      - name: Security vulnerability scan
+      - name: Security audit
         run: npm audit --audit-level=high
 
-      - name: Unit tests
+      - name: Run unit tests
         run: npm test
 
+
+  # ==========================================
+  # 2. BUILD & PUSH DOCKER IMAGE
+  # ==========================================
   build:
     name: Build & Push Docker Image
     needs: test
+
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
     runs-on: ubuntu-latest
+
     outputs:
       image: ${{ steps.meta.outputs.image }}
       tag: ${{ steps.meta.outputs.tag }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
 
-      - name: Calculate image tag
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Generate Docker image tag
         id: meta
         shell: bash
         run: |
           TAG="sha-${GITHUB_SHA::12}"
-          IMAGE="${{ env.IMAGE_NAME }}:${TAG}"
+          IMAGE="${{ env.DOCKER_IMAGE }}:${TAG}"
+
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
 
-      - name: Verify Docker Hub secrets
+          echo "Docker image: ${IMAGE}"
+
+      - name: Verify Docker Hub credentials
         shell: bash
         run: |
           if [ -z "${{ secrets.DOCKERHUB_USERNAME }}" ]; then
-            echo "DOCKERHUB_USERNAME is missing"
+            echo "ERROR: DOCKERHUB_USERNAME is missing"
             exit 1
           fi
 
           if [ -z "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
-            echo "DOCKERHUB_TOKEN is missing"
+            echo "ERROR: DOCKERHUB_TOKEN is missing"
             exit 1
           fi
 
-          echo "Docker Hub credentials verified."
+          echo "Docker Hub credentials are available."
 
       - name: Login to Docker Hub
-        uses: docker/login-action@v4
+        uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Build and push image
-        uses: docker/build-push-action@v7
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
         with:
           context: .
           push: true
+
           tags: |
             ${{ steps.meta.outputs.image }}
-            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.DOCKER_IMAGE }}:latest
+
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+
+  # ==========================================
+  # 3. DEPLOY TO AWS EC2
+  # ==========================================
   deploy:
     name: Deploy to AWS EC2
     needs: build
+
     runs-on: ubuntu-latest
+
     environment: production
+
     steps:
-      - name: Deploy over SSH
+
+      - name: Deploy application to EC2
         uses: appleboy/ssh-action@v1.2.2
+
         env:
           IMAGE: ${{ needs.build.outputs.image }}
           APP_PORT: ${{ env.APP_PORT }}
@@ -120,19 +154,38 @@ jobs:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           GIT_SHA: ${{ github.sha }}
+
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USERNAME }}
           key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
-          port: ${{ secrets.EC2_SSH_PORT || 22 }}
+          port: ${{ secrets.EC2_SSH_PORT }}
+
           envs: IMAGE,APP_PORT,CONTAINER_NAME,DOCKERHUB_USERNAME,DOCKERHUB_TOKEN,GIT_SHA
+
           script: |
             set -eu
 
-            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+            echo "======================================"
+            echo "Starting deployment"
+            echo "======================================"
+
+            echo "Logging into Docker Hub..."
+
+            echo "$DOCKERHUB_TOKEN" | docker login \
+              -u "$DOCKERHUB_USERNAME" \
+              --password-stdin
+
+            echo "Pulling Docker image:"
+            echo "$IMAGE"
+
             docker pull "$IMAGE"
 
+            echo "Stopping old container..."
+
             docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+
+            echo "Starting new container..."
 
             docker run -d \
               --name "$CONTAINER_NAME" \
@@ -143,20 +196,54 @@ jobs:
               -e GIT_SHA="$GIT_SHA" \
               "$IMAGE"
 
-            echo "Waiting for application health check..."
+            echo "Container started."
+
+            echo "======================================"
+            echo "Waiting for health check..."
+            echo "======================================"
+
             for i in $(seq 1 20); do
-              if wget -qO- "http://127.0.0.1:${APP_PORT}/health" | grep -q '"UP"'; then
-                echo "Deployment healthy."
+
+              if wget -qO- \
+                "http://127.0.0.1:${APP_PORT}/health" \
+                | grep -q '"UP"'; then
+
+                echo "======================================"
+                echo "Deployment successful!"
+                echo "Application is healthy."
+                echo "======================================"
+
                 break
               fi
+
               if [ "$i" -eq 20 ]; then
-                echo "Health check failed. Container logs:"
+
+                echo "======================================"
+                echo "Health check FAILED"
+                echo "======================================"
+
+                docker ps -a
+
+                echo "Container logs:"
+
                 docker logs "$CONTAINER_NAME" || true
+
                 exit 1
               fi
+
+              echo "Waiting... attempt $i/20"
+
               sleep 3
+
             done
 
-            docker image prune -af --filter "until=168h"
+            echo "Cleaning unused Docker resources..."
+
+            docker image prune -af \
+              --filter "until=168h"
+
             docker container prune -f
+
             docker logout || true
+
+            echo "Deployment finished."
