@@ -1,0 +1,21 @@
+{
+  "name": "devops-cicd-node-api",
+  "version": "1.0.0",
+  "description": "Portfolio-grade Node.js API for GitHub Actions, Docker and AWS EC2 CI/CD",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "lint": "eslint .",
+    "test": "jest --runInBand --coverage",
+    "security": "npm audit --audit-level=high"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  },
+  "devDependencies": {
+    "eslint": "^9.35.0",
+    "jest": "^30.1.3",
+    "supertest": "^7.1.4"
+  }
+}
